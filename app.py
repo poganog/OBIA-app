@@ -10,6 +10,8 @@ st.set_page_config(page_title="OBIA 4 EVER", layout="centered")
 st.title("OBIA Yourself")
 
 # --- Initialize session state ---
+if "username" not in st.session_state:
+    st.session_state.username = ""
 if "use_city_input" not in st.session_state:
     st.session_state.use_city_input = False
 if "coords" not in st.session_state:
@@ -18,6 +20,18 @@ if "city_name" not in st.session_state:
     st.session_state.city_name = ""
 if "selected_location" not in st.session_state:
     st.session_state.selected_location = 0
+
+# --- Step 0: Username input ---
+if not st.session_state.username:
+    st.subheader("Welcome! What should we call you?")
+    username = st.text_input("Enter your username or alias:")
+    if st.button("Submit username"):
+        if username:
+            st.session_state.username = username
+            st.rerun()
+        else:
+            st.error("Please enter a username.")
+    st.stop()
 
 # --- Step 1: Coordinates input ---
 if not st.session_state.use_city_input and st.session_state.coords is None:
@@ -43,7 +57,7 @@ if st.session_state.use_city_input and st.session_state.coords is None:
     st.session_state.city_name = st.text_input("Address", value=st.session_state.city_name)
     if st.button("Submit address"):
         if st.session_state.city_name:
-            geolocator = Nominatim(user_agent="obia")
+            geolocator = Nominatim(user_agent=st.session_state.username)
             try:
                 locations = geolocator.geocode(
                     st.session_state.city_name, exactly_one=False, language="en"
@@ -86,7 +100,7 @@ if st.session_state.coords:
     # List of loading message templates
     loading_message_templates = [
         "Finding {humanoids} for this Herculean Task...",
-        "Filling up the Meldezettel for all the {humanoids} so that they can legally reside in the State of Salzburg..."
+        "Filling up the Meldezettel for all the {humanoids} so that they can legally reside in the State of Salzburg...",
         "Training {humanoids} in Spatial Thinking...",
         "Un-aliving useless {humanoids} who couldn't complete the RIF with a positive average...",
         "Sending Team of {humanoids} to find the best Sentinel Image...",
@@ -98,7 +112,7 @@ if st.session_state.coords:
     ]
 
     # Display loading messages and GIF
-    for template in loading_message_templates:
+    for i, template in enumerate(loading_message_templates):
         message = template.format(humanoids=random_humanoids)  # Format the message
         placeholder.markdown(
             f"""
@@ -109,7 +123,10 @@ if st.session_state.coords:
             """,
             unsafe_allow_html=True,
         )
-        time.sleep(10)
+        if i == 0:
+            time.sleep(10)  # First message: 10 seconds
+        else:
+            time.sleep(15)  # Subsequent messages: 15 seconds
 
     # Connect to OpenEO
     connection = openeo.connect("openeofed.dataspace.copernicus.eu")
@@ -117,9 +134,9 @@ if st.session_state.coords:
     # Load Sentinel-2 collection
     datacube = connection.load_collection(
         "SENTINEL2_L2A",
-        spatial_extent={"west": lon-0.05, "south": lat-0.05,
-                        "east": lon+0.05, "north": lat+0.05},
-        temporal_extent=["2025-01-01","2026-03-01"],
+        spatial_extent={"west": lon-0.025, "south": lat-0.025,
+                        "east": lon+0.025, "north": lat+0.025},
+        temporal_extent=["2025-10-01","2026-03-01"],
         bands=["B02","B03","B04","B08","SCL"],
         max_cloud_cover=30,
     )

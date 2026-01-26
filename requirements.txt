@@ -2,4 +2,10 @@ streamlit
 geopy
 openeo
 rasterio
+pandas
 numpy
+matplotlib
+concurrent
+skimage
+sklearn
+xarray

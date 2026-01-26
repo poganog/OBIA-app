@@ -6,5 +6,5 @@ pandas
 numpy
 matplotlib
 scikit-image
-scikit-image
+scikit-learn
 xarray

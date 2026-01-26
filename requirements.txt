@@ -5,7 +5,6 @@ rasterio
 pandas
 numpy
 matplotlib
-concurrent
 scikit-image
 scikit-image
 xarray

@@ -6,6 +6,6 @@ pandas
 numpy
 matplotlib
 concurrent
-skimage
-sklearn
+scikit-image
+scikit-image
 xarray

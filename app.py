@@ -103,7 +103,7 @@ def download_sentinel_data(lat, lon, username, mode="recent", min_coverage=0.99)
         if mode == "recent":
             time_interval = ["2025-02-01", "2026-02-01"]
         elif mode == "oldest":
-            time_interval = ["2016-01-01", "2019-01-01"]
+            time_interval = ["2015-06-01", "2018-06-01"]
 
         # First, get a small sample to check available dates
         datacube = connection.load_collection(

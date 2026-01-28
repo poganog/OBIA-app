@@ -7,12 +7,12 @@ import random
 import concurrent.futures
 import skimage.filters
 import skimage.morphology
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 from skimage.segmentation import mark_boundaries, slic
 from skimage.color import rgb2gray
 from sklearn.ensemble import RandomForestClassifier
-from skimage.measure import regionprops_table
+from skimage.measure import regionprops_table, label as sk_label
+from skimage.morphology import footprint_rectangle
+from skimage.util import map_array
 import xarray as xr
 import os
 import pandas as pd
@@ -34,32 +34,37 @@ defaults = {
     "coords": None,
     "city_name": "",
     "selected_location": 0,
-    "step": 1,                    # simple step machine: 1=coords, 2=method, 3=params, 4=sentinel_shown, 5=seg_done
-    "rgb_full": None,             # store results so we don't recompute / redraw wrong stuff
-    "ndvi": None,                 # NDVI array loaded alongside RGB
-    "rgb_old": None,              # NEW: store old image RGB
-    "ndvi_old": None,             # NEW: store old image NDVI
+    "step": 1,                      # simple step machine: 1=coords, 2=method, 3=params, 4=sentinel_shown, 5=seg_done
+    "rgb_full": None,               # store results so we don't recompute / redraw wrong stuff
+    "ndvi": None,                   # NDVI array loaded alongside RGB
+    "rgb_old": None,                # NEW: store old image RGB
+    "ndvi_old": None,               # NEW: store old image NDVI
     "seg_vis": None,
     "seg_params": None,
-    "seg_method": "clustering",   # store segmentation method
-    "full_path": None,            # compute NDVI without re-downloading
-    "old_path": None,             # NEW: path to old image
-    "recent_date": None,          # NEW: acquisition date of recent image
-    "old_date": None,             # NEW: acquisition date of old image
-    "compactness": 10.0,          # SLIC params
+    "seg_method": "clustering",     # store segmentation method
+    "full_path": None,              # compute NDVI without re-downloading
+    "old_path": None,               # NEW: path to old image
+    "recent_date": None,            # NEW: acquisition date of recent image
+    "old_date": None,               # NEW: acquisition date of old image
+    "compactness": 10.0,            # SLIC params
     "n_segments": 2000,
-    "ndvi_threshold": 0.2,        # NDVI and mask sliders
-    "median_window": 11,          # odd value for median filter
-    "use_otsu_auto": False,       # switch between supervised (slider) and true Otsu auto-thresholding
-    "ws_input": "grayscale_rgb",  # watershed params
-    "ws_min_region": 200,         # minimum region size (pixels) for watershed merging
-    "classification_enabled": False,  # NEW: toggle for classification
-    "class_mapping": None,            # NEW: user's class definition
-    "class_names": None,              # NEW: class names
-    "class_colors": None,             # NEW: class colors
-    "clf": None,                      # NEW: trained classifier
-    "classification_results": None,   # NEW: classification output
-    "segments": None,                 # NEW: store SLIC segments for classification
+    "ndvi_threshold": 0.2,          # NDVI and mask sliders
+    "median_window": 11,            # odd value for median filter
+    "use_otsu_auto": False,         # switch between supervised (slider) and true Otsu auto-thresholding
+    "ws_input": "grayscale_rgb",    # watershed params
+    "ws_min_region": 200,           # minimum region size (pixels) for watershed merging
+    "classification_method": None,  # NEW: "ml" or "rule_based"
+    "clf": None,                    # NEW: trained classifier
+    "classification_results": None, # NEW: classification output
+    "segments": None,               # NEW: store segments for classification
+    "all_feats_df": None,          # NEW: features dataframe
+    "classification_stats": None,
+    "used_confidence": None,
+    "training_count": None,
+    "comparison_complete": False,   # NEW: track if comparison calculation is done
+    "segments_old": None,           # NEW: store old image segments
+    "all_feats_df_old": None,       # NEW: store old image features
+    "classification_rgb_old": None, # NEW: store old image classification
     
 }
 for key, value in defaults.items():
@@ -106,7 +111,7 @@ def download_sentinel_data(lat, lon, username, mode="recent", min_coverage=0.99)
             spatial_extent={"west": lon-0.001, "south": lat-0.001,
                             "east": lon+0.001, "north": lat+0.001},
             temporal_extent=time_interval,
-            bands=["B02"],
+            bands=["SCL"],
             max_cloud_cover=25,
         )
 
@@ -143,7 +148,7 @@ def download_sentinel_data(lat, lon, username, mode="recent", min_coverage=0.99)
                 spatial_extent={"west": lon-0.01, "south": lat-0.01,
                                 "east": lon+0.01, "north": lat+0.01},
                 temporal_extent=[date_str, date_str],
-                bands=["B02"],
+                bands=["SCL"],
             )
             
             test_date_path = f"test_{username}_{date_str}_{mode}.nc"
@@ -151,12 +156,17 @@ def download_sentinel_data(lat, lon, username, mode="recent", min_coverage=0.99)
             
             # Check coverage
             ds_test = xr.open_dataset(test_date_path)
-            if 'B02' in ds_test:
-                data = ds_test['B02'].values.squeeze()
-                valid_pixels = np.sum(~np.isnan(data) & (data > 0))
-                total_pixels = data.size
-                coverage = valid_pixels / total_pixels
+            if 'SCL' in ds_test:
+                data = ds_test['SCL'].values.squeeze()
                 
+                # Non-zero coverage
+                coverage = np.sum(data != 0) / data.size
+                
+                # cloudiness: classes 8 (medium) and 9 (high)
+                #cloud_mask = np.isin(data, [8, 9])
+                #cloudiness = np.sum(cloud_mask) / data.size
+                
+                #print(f"{date_str}: {coverage*100:.1f}% coverage, {cloudiness*100:.1f}% cloudiness", end="")
                 print(f"{date_str}: {coverage*100:.1f}% coverage", end="")
                 
                 ds_test.close()
@@ -165,6 +175,7 @@ def download_sentinel_data(lat, lon, username, mode="recent", min_coverage=0.99)
                 if os.path.exists(test_date_path):
                     os.remove(test_date_path)
                 
+                #if coverage >= min_coverage and cloudiness <= 0.5:
                 if coverage >= min_coverage:
                     print(" ✓ Good!\n")
                     
@@ -243,6 +254,18 @@ def reset_after_coords():
     st.session_state.recent_date = None
     st.session_state.old_date = None
     st.session_state.use_otsu_auto = False
+    st.session_state.classification_method = None
+    st.session_state.classification_results = None
+    st.session_state.clf = None
+    st.session_state.all_feats_df = None
+    st.session_state.classification_stats = None
+    st.session_state.used_confidence = None
+    st.session_state.training_count = None
+    st.session_state.segments = None
+    st.session_state.comparison_complete = False
+    st.session_state.segments_old = None
+    st.session_state.all_feats_df_old = None
+    st.session_state.classification_rgb_old = None
     if "download_future_recent" in st.session_state:
         del st.session_state.download_future_recent
     if "download_future_old" in st.session_state:
@@ -434,6 +457,43 @@ def merge_small_regions(labels, min_size=200):
 
     return lab
 
+def fix_watershed_boundaries(labels):
+    """
+    Assign boundary pixels (label 0) to their nearest neighboring region.
+    This ensures all pixels are classified.
+    """
+    
+    lab = labels.copy()
+    boundary_mask = (lab == 0)
+    
+    if not boundary_mask.any():
+        return lab
+    
+    # Use distance transform to find nearest non-zero label
+    # For each 0 pixel, find the nearest non-zero neighbor
+    H, W = lab.shape
+    
+    for y, x in zip(*np.where(boundary_mask)):
+        # Check 3x3 neighborhood
+        neighbor_labels = []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < H and 0 <= nx < W:
+                    nlab = lab[ny, nx]
+                    if nlab > 0:
+                        neighbor_labels.append(nlab)
+        
+        # Assign to most common neighbor, or first if tie
+        if neighbor_labels:
+            # Use most common neighbor
+            unique, counts = np.unique(neighbor_labels, return_counts=True)
+            lab[y, x] = unique[np.argmax(counts)]
+    
+    return lab
+
 def extract_features_for_classification(segments, rgb, ndvi):
     """Extract features for each segment for classification."""
     props = regionprops_table(
@@ -516,7 +576,11 @@ def assign_scl_labels(all_feats_df, segments, scl_segmented, class_mapping,
             all_feats_df.loc[candidate['idx'], 'class'] = class_id
             all_feats_df.loc[candidate['idx'], 'scl_confidence'] = candidate['confidence']
         
-        avg_conf = np.mean([c['confidence'] for c in selected_candidates])
+        if n_samples > 0:
+            avg_conf = float(np.mean([c['confidence'] for c in selected_candidates]))
+        else:
+            avg_conf = 0.0
+        
         stats[class_id] = {
             'selected': n_samples,
             'available': len(candidates),
@@ -587,6 +651,143 @@ def extract_scl_from_file(file_path, segments):
             scl_segmented[mask] = most_common
     
     return scl, scl_segmented
+
+def get_available_classes(scl_segmented):
+    """Determine which classes are available in the image based on SCL."""
+    unique_scl = np.unique(scl_segmented)
+    available = {}
+    
+    # Always include basic classes if their SCL values are present
+    if any(val in unique_scl for val in [5]):  # Not-vegetated
+        available[0] = {
+            "name": "Urban/Bare Soil",
+            "scl_values": [5],
+            "color": [1, 0.9, 0.35]  # Yellow
+        }
+    
+    if any(val in unique_scl for val in [4]):  # Vegetation
+        available[1] = {
+            "name": "Vegetation",
+            "scl_values": [4],
+            "color": [0, 0.62, 0]  # Green
+        }
+    
+    if any(val in unique_scl for val in [6]):  # Water
+        available[2] = {
+            "name": "Water",
+            "scl_values": [6],
+            "color": [0, 0.4, 1]  # Blue
+        }
+    
+    if any(val in unique_scl for val in [11]):  # Snow/Ice
+        available[3] = {
+            "name": "Snow/Ice",
+            "scl_values": [11],
+            "color": [1, 0.95, 1]  # Pale pink
+        }
+    
+    return available
+
+def convert_segmentation_to_labels(seg_vis, rgb_full):
+    """
+    Convert any segmentation visualization to a label array.
+    Works for SLIC, Otsu masks, and watershed boundaries.
+    """
+    # For Otsu (binary mask)
+    if seg_vis.ndim == 2 or (seg_vis.ndim == 3 and seg_vis.shape[2] == 1):
+        return seg_vis.astype(int)
+    
+    # For marked boundaries (RGB image with boundaries)
+    # Try to detect segments by finding connected components
+    
+    # If it's similar to original RGB, extract boundaries
+    diff = np.abs(seg_vis - rgb_full).sum(axis=2) if seg_vis.ndim == 3 else np.abs(seg_vis - np.mean(rgb_full, axis=2))
+    boundaries = diff > 0.1
+    
+    # Invert boundaries to get regions
+    regions = ~boundaries
+    
+    # Label connected components
+    segments = sk_label(regions, connectivity=2)
+    
+    return segments
+
+def rule_based_classification(segments, ndvi):
+    """
+    Perform rule-based classification using NDVI thresholds.
+    
+    Args:
+        segments: Segmented image (label array)
+        ndvi: NDVI array
+    
+    Returns:
+        rgb_output: RGB classification image
+        all_feats_df: DataFrame with classification results
+        max_ndvi: Maximum NDVI value in the image
+    """
+    # --- 1. Data Preparation ---
+    # Ensure NDVI is in the range -1 to 1 (Normalization)
+    if np.max(ndvi) > 10:
+        ndvi_normalized = ndvi / 10000.0
+    else:
+        ndvi_normalized = ndvi
+    
+    # Fill NaN values (holes) with 0 to prevent calculation errors
+    ndvi_normalized = np.nan_to_num(ndvi_normalized, nan=0.0)
+    
+    # --- 2. Feature Calculation ---
+    # Calculate the mean NDVI for each segment using regionprops_table
+    props = regionprops_table(
+        segments,
+        intensity_image=ndvi_normalized,
+        properties=['label', 'mean_intensity']
+    )
+    
+    all_feats_df = pd.DataFrame(props)
+    all_feats_df.rename(columns={'label': 'indx', 'mean_intensity': 'ndvi_mean'}, inplace=True)
+    
+    # Handle any NaN or inf values
+    all_feats_df['ndvi_mean'] = all_feats_df['ndvi_mean'].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    
+    # --- 3. Rule-Based Classification ---
+    # Definition of thresholds:
+    # Water: < -0.25
+    # Vegetation: > 0.45
+    # No-Vegetation: Everything in between (-0.25 to 0.45)
+    conditions = [
+        (all_feats_df["ndvi_mean"] < -0.25),                                # Water (ID 6)
+        (all_feats_df["ndvi_mean"] > 0.45),                                 # Vegetation (ID 4)
+        ((all_feats_df["ndvi_mean"] >= -0.25) & (all_feats_df["ndvi_mean"] <= 0.45)) # No-Veg (ID 5)
+    ]
+    
+    # Assignment of class IDs (matching SCL IDs)
+    choices = [6, 4, 5]  # Water, Vegetation, No-Vegetation
+    all_feats_df["class"] = np.select(conditions, choices, default=5)
+    
+    # --- 4. Mapping & Color Image Creation ---
+    # Create an array with the class IDs (4, 5, or 6)
+    mapped_rule_based = map_array(
+        segments, 
+        np.array(all_feats_df["indx"]), 
+        np.array(all_feats_df["class"])
+    )
+    
+    # Create an empty image with 3 color channels (RGB)
+    h, w = mapped_rule_based.shape
+    result_rgb = np.zeros((h, w, 3))
+    
+    # Manual color assignment for 100% control:
+    # ID 4 (Vegetation) -> GREEN
+    result_rgb[mapped_rule_based == 4] = [0.0, 0.6, 0.0]
+    # ID 5 (No-Vegetation) -> YELLOW
+    result_rgb[mapped_rule_based == 5] = [1.0, 0.9, 0.4]
+    # ID 6 (Water) -> BLUE
+    result_rgb[mapped_rule_based == 6] = [0.0, 0.0, 0.7]
+    
+    # Get max NDVI for info
+    max_ndvi = all_feats_df['ndvi_mean'].max()
+    
+    return result_rgb, all_feats_df, max_ndvi
 
 # -----------------------------
 # Step 0: Username
@@ -727,7 +928,7 @@ if st.session_state.step == 3:
 
     if st.session_state.seg_method == "clustering":
         # NEW: short explanations
-        st.caption("SLIC settings: control how many “superpixels” (segments) you get and how “compact” their shapes are.")
+        st.caption('SLIC settings: control how many “superpixels” (segments) you get and how “compact” their shapes are.')
         with st.form("seg_params_form"):
             compactness = st.slider("Compactness", 0.1, 50.0, float(st.session_state.compactness))
             st.caption("Compactness: high compactness = more square/regular segments, lower compactness = segments stick more to image boundaries.")
@@ -743,7 +944,7 @@ if st.session_state.step == 3:
 
     elif st.session_state.seg_method == "otsu":
         # NEW: short explanations
-        st.caption("NDVI (Normalized Difference Vegetation Index) thresholding: binary mask that separates pixels into two groups (above threshold vs below). You can set the threshold manually or let Otsu’s method find an optimal value automatically.")
+        st.caption("NDVI (Normalized Difference Vegetation Index) thresholding: binary mask that separates pixels into two groups (above threshold vs below). You can set the threshold manually or let Otsu's method find an optimal value automatically.")
         with st.form("otsu_params_form"):
             ndvi_threshold = st.slider("NDVI threshold", -1.0, 1.0, float(st.session_state.ndvi_threshold), step=0.01)
             st.caption("NDVI threshold: pixels above this value are usually vegetation.")
@@ -812,12 +1013,12 @@ if st.session_state.step == 4:
     if st.session_state.rgb_full is not None:
         st.image(
             st.session_state.rgb_full,
-            caption=f"Recent image ({lat:.5f}, {lon:.5f}) - {st.session_state.recent_date}",
+            caption=f"Image from {st.session_state.recent_date} ({lat:.5f}, {lon:.5f})",
             width='stretch'
         )
 
     else:
-        message = f"Sending {random.choice(mythical_humanoids)} to find the Sentinel Images..."
+        message = f"Sending {random.choice(mythical_humanoids)} to find the latest Sentinel Image..."
 
         # Connect back to the futures
         if ("download_future_recent" in st.session_state and st.session_state.download_future_recent):
@@ -913,7 +1114,6 @@ if st.session_state.step == 5:
                     compactness=float(st.session_state.compactness),
                     start_label=1
                 )
-                # STORE SEGMENTS for classification
                 st.session_state.segments = segments
                 
                 seg_vis = mark_boundaries(rgb_full, segments, color=(1, 0, 0), mode="thick")
@@ -923,7 +1123,6 @@ if st.session_state.step == 5:
                     "compactness": float(st.session_state.compactness)
                 }
 
-            # ... keep your existing otsu and watershed code ...
             elif st.session_state.seg_method == "otsu":
                 ndvi = st.session_state.ndvi
                 if st.session_state.use_otsu_auto:
@@ -932,9 +1131,26 @@ if st.session_state.step == 5:
                     threshold = float(st.session_state.ndvi_threshold)
                 mask = ndvi > threshold
                 k = int(st.session_state.median_window)
-                structuring_element = skimage.morphology.rectangle(k, k)
+                structuring_element = footprint_rectangle((k, k))
                 filtered_mask = skimage.filters.median(mask, structuring_element)
-                seg_vis = mark_boundaries(rgb_full, filtered_mask, color=(1, 0, 0), mode="thick")
+                
+                # Label both foreground AND background regions
+                binary = filtered_mask.astype(bool)
+                
+                # Label foreground (True values)
+                foreground_labels = sk_label(binary, connectivity=2)
+                
+                # Label background (False values) - invert the mask
+                background_labels = sk_label(~binary, connectivity=2)
+                
+                # Combine: shift background labels to avoid overlap
+                max_fg_label = foreground_labels.max()
+                segments = foreground_labels.copy()
+                segments[background_labels > 0] = background_labels[background_labels > 0] + max_fg_label
+                
+                st.session_state.segments = segments
+                
+                seg_vis = mark_boundaries(rgb_full, segments, color=(1, 0, 0), mode="thick")
                 st.session_state.seg_params = {
                     "method": "otsu_ndvi_auto" if st.session_state.use_otsu_auto else "otsu_ndvi",
                     "threshold": float(threshold),
@@ -955,6 +1171,14 @@ if st.session_state.step == 5:
 
                 labels = watershed_segmentation(gray_u8)
                 labels = merge_small_regions(labels, min_size=int(st.session_state.ws_min_region))
+                
+                # Fix label 0 (boundaries) by assigning them to nearest neighbor
+                # This ensures all pixels get classified
+                labels = fix_watershed_boundaries(labels)
+                
+                # Store watershed labels as segments
+                st.session_state.segments = labels
+                
                 boundary_mask = labels_to_boundaries(labels)
                 seg_vis = mark_boundaries(rgb_full, boundary_mask, color=(1, 0, 0), mode="thick")
                 st.session_state.seg_params = {
@@ -988,99 +1212,289 @@ if st.session_state.step == 5:
 
     st.image(st.session_state.seg_vis, caption=caption, width='stretch')
 
+    # New navigation layout
+    st.markdown("---")
+    st.subheader("Are you satisfied with this segmentation?")
+    
+    # Primary action
+    if st.button("Yes, proceed to classification", width='stretch'):
+        st.session_state.step = 6
+        st.rerun()
+    
+    # Secondary options
+    st.subheader("No?")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("Change parameters"):
+            st.session_state.step = 3
+            st.session_state.seg_vis = None
+            st.session_state.seg_params = None
+            st.session_state.segments = None
+            st.rerun()
+    
+    with col2:
+        if st.button("Change method"):
+            st.session_state.step = 2
+            st.session_state.seg_vis = None
+            st.session_state.seg_params = None
+            st.session_state.segments = None
+            st.rerun()
+    
+    with col3:
+        if st.button("Change location"):
+            reset_to_step_one()
+
+# ============================================================================
+# NEW STEP 6: CLASSIFICATION
+# ============================================================================
+
+if st.session_state.step == 6:
+    st.subheader("Step 6: Land Cover Classification")
+    
+    with st.expander("View original image", expanded=False):
+        st.image(
+            st.session_state.rgb_full,
+            caption=f"Original Sentinel image – {st.session_state.recent_date}",
+            width='stretch'
+        )
+    
+    # Show original segmentation for reference
+    with st.expander("View Segmentation", expanded=False):
+        st.image(st.session_state.seg_vis, caption="Your segmentation", width='stretch')
+    
+    st.markdown("---")
+    
+    # Choose classification method
+    st.markdown("### Choose Classification Method")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("Machine Learning", width='stretch', type="primary" if st.session_state.classification_method != "rule_based" else "secondary"):
+            st.session_state.classification_method = "ml"
+            st.session_state.classification_results = None
+            st.rerun()
+    
+    with col2:
+        if st.button("Rule-Based", width='stretch', type="primary" if st.session_state.classification_method == "rule_based" else "secondary"):
+            st.session_state.classification_method = "rule_based"
+            st.session_state.classification_results = None
+            st.rerun()
+    
     # ========================================================================
-    # NEW: CLASSIFICATION SECTION (only for SLIC clustering)
+    # RULE-BASED CLASSIFICATION
     # ========================================================================
-    if st.session_state.seg_method == "clustering" and st.session_state.segments is not None:
+    if st.session_state.classification_method == "rule_based":
         st.markdown("---")
-        st.subheader("🤖 AI-Powered Classification (Optional)")
+        st.markdown("### Rule-Based Classification")
         
-        with st.expander("ℹ️ What is this?", expanded=False):
-            st.markdown("""
-            This uses **machine learning** to automatically classify your segments into different land cover types 
-            (like vegetation, water, urban areas, etc.) using Sentinel-2's Scene Classification Layer (SCL) as training data.
-            
-            - Uses max **30% of segments** for training
-            - The AI learns patterns and classifies the rest
-            - Great for land cover analysis!
-            """)
+        st.info("""
+        The algorithm uses NDVI thresholds to classify land cover:
+        - **Water**: NDVI < -0.25 (Blue)
+        - **Vegetation**: NDVI > 0.45 (Green)
+        - **No-Vegetation**: -0.25 ≤ NDVI ≤ 0.45 (Yellow)
+        """)
         
-        if st.checkbox("Enable AI Classification", value=st.session_state.classification_enabled):
-            st.session_state.classification_enabled = True
+        # Run classification button
+        if st.button("Run Classification", width='stretch', type="primary"):
+            classification_message = f"{random.choice(mythical_humanoids)} are classifying your image..."
             
-            # Step 1: Define classes
-            st.markdown("### 1. Define Your Classes")
+            with st.spinner(classification_message):
+                try:
+                    # Run rule-based classification
+                    result_rgb, all_feats_df, max_ndvi = rule_based_classification(
+                        st.session_state.segments,
+                        st.session_state.ndvi
+                    )
+                    
+                    # Store results - add 'prediction' column for consistency
+                    all_feats_df['prediction'] = all_feats_df['class']
+                    st.session_state.classification_results = result_rgb
+                    st.session_state.all_feats_df = all_feats_df
+                    st.session_state.max_ndvi = max_ndvi
+                    
+                    st.rerun()
+                
+                except Exception as e:
+                    st.error(f"Classification failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+        
+        # Show results if available
+        if st.session_state.classification_results is not None:
+            st.markdown("---")
+            st.markdown("### Classification Results")
             
-            n_classes = st.number_input("How many classes?", min_value=2, max_value=6, value=3)
+            # Legend above the image
+            st.markdown("**Legend:**")
+            leg_cols = st.columns(3)
+            
+            class_info_legend = {
+                4: {"name": "Vegetation", "color": [0.0, 0.6, 0.0]},
+                5: {"name": "No-Vegetation", "color": [1.0, 0.9, 0.4]},
+                6: {"name": "Water", "color": [0.0, 0.0, 0.7]}
+            }
+            
+            st.session_state.class_names = {
+                4: "Vegetation",
+                5: "No-Vegetation",
+                6: "Water"
+            }
+            
+            for i, (class_id, info) in enumerate(class_info_legend.items()):
+                with leg_cols[i]:
+                    color = info['color']
+                    st.color_picker(
+                        info['name'], 
+                        value=f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}",
+                        disabled=True,
+                        key=f"legend_rule_{class_id}"
+                    )
+            
+            # Display the classification image
+            st.image(
+                st.session_state.classification_results,
+                width='stretch'
+            )
+            
+            # Statistics below image
+            st.markdown("### Classification Statistics")
+            
+            # Calculate percentages for each class
+            class_counts = st.session_state.all_feats_df['class'].value_counts()
+            total_segments = len(st.session_state.all_feats_df)
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                veg_count = class_counts.get(4, 0)
+                veg_pct = (veg_count / total_segments) * 100
+                st.metric("Vegetation", f"{veg_pct:.1f}%", f"{veg_count} segments", delta_color="off", delta_arrow="off")
+            
+            with col2:
+                no_veg_count = class_counts.get(5, 0)
+                no_veg_pct = (no_veg_count / total_segments) * 100
+                st.metric("No-Vegetation", f"{no_veg_pct:.1f}%", f"{no_veg_count} segments", delta_color="off", delta_arrow="off")
+            
+            with col3:
+                water_count = class_counts.get(6, 0)
+                water_pct = (water_count / total_segments) * 100
+                st.metric("Water", f"{water_pct:.1f}%", f"{water_count} segments", delta_color="off", delta_arrow="off")
+            
+            # Additional info
+            st.markdown("---")
+            st.info(f"**Maximum NDVI in image**: {st.session_state.max_ndvi:.4f}")
+            
+            if st.session_state.max_ndvi <= 0.45:
+                st.warning("⚠️ The maximum NDVI is below 0.45, so no vegetation was detected. This is expected for areas with minimal plant life.")
+    
+            st.markdown("---")
+            st.subheader("Would you like to know how this place changed in the last decade?")
+            if st.button("Yes, show me the changes!", type="primary", width='stretch'):
+                st.session_state.step = 7
+                st.session_state.comparison_complete = False  # Reset comparison state
+                st.rerun()
+    
+    # ========================================================================
+    # MACHINE LEARNING CLASSIFICATION
+    # ========================================================================
+    elif st.session_state.classification_method == "ml":
+        st.markdown("---")
+        st.markdown("### Machine Learning Classification")
+        
+        st.info("""
+        The algorithm will automatically:
+        - Use Sentinel-2's Scene Classification Layer (SCL) to identify training samples
+        - Train on maximum 30% of your segments
+        - Classify all remaining segments based on learned patterns
+        """)
+        
+        # Detect available classes
+        try:
+            scl, scl_segmented = extract_scl_from_file(
+                st.session_state.full_path, 
+                st.session_state.segments
+            )
+            available_classes = get_available_classes(scl_segmented)
+            
+            if len(available_classes) == 0:
+                st.error("No suitable land cover types detected in this image. The image may be mostly clouds or defective pixels.")
+                st.stop()
+            
+            # Show available classes
+            st.markdown("**Classes to be identified:**")
+            cols = st.columns(len(available_classes))
             
             class_mapping = {}
             class_names = {}
             class_colors = {}
             
-            st.markdown("**Available SCL values for training:**")
-            st.caption("4=Vegetation, 5=Not-Vegetated/Urban, 6=Water, 2=Shadows, 11=Snow/Ice")
-            
-            for i in range(n_classes):
-                with st.expander(f"Class {i}", expanded=True):
-                    name = st.text_input(f"Class {i} name", value=f"Class_{i}", key=f"name_{i}")
-                    
-                    scl_options = st.multiselect(
-                        "SCL values for training",
-                        options=[2, 3, 4, 5, 6, 11],
-                        format_func=lambda x: f"{x}: {scl_legend[x]}",
-                        key=f"scl_{i}"
+            for i, (class_id, class_info) in enumerate(available_classes.items()):
+                with cols[i]:
+                    st.markdown(f"**{class_info['name']}**")
+                    color = class_info['color']
+                    st.color_picker(
+                        "Color", 
+                        value=f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}",
+                        disabled=True,
+                        key=f"color_preview_{class_id}"
                     )
-                    
-                    col1, col2, col3 = st.columns(3)
-                    r = col1.slider("Red", 0.0, 1.0, 0.5, key=f"r_{i}")
-                    g = col2.slider("Green", 0.0, 1.0, 0.5, key=f"g_{i}")
-                    b = col3.slider("Blue", 0.0, 1.0, 0.5, key=f"b_{i}")
-                    
-                    st.color_picker("Preview", value=f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}", disabled=True)
-                    
-                    if scl_options:
-                        class_mapping[i] = scl_options
-                        class_names[i] = name
-                        class_colors[i] = [r, g, b]
+                
+                class_mapping[class_id] = class_info['scl_values']
+                class_names[class_id] = class_info['name']
+                class_colors[class_id] = class_info['color']
+                
+                st.session_state.class_mapping = class_mapping
+                st.session_state.class_names = class_names
+                st.session_state.class_colors = class_colors
             
-            # Step 2: Run classification
-            if len(class_mapping) > 0 and st.button("🚀 Run Classification"):
-                with st.spinner("Extracting SCL and running classification..."):
+            st.markdown("---")
+            
+            # Run classification button
+            if st.button("Run Classification", width='stretch', type="primary"):
+                classification_message = f"{random.choice(mythical_humanoids)} are classifying your image..."
+                
+                with st.spinner(classification_message):
                     try:
-                        # Extract SCL
-                        scl, scl_segmented = extract_scl_from_file(st.session_state.full_path, st.session_state.segments)
-                        
                         # Extract features
                         all_feats_df = extract_features_for_classification(
                             st.session_state.segments,
                             st.session_state.rgb_full,
                             st.session_state.ndvi
                         )
+                                                
+                        # First try with strict confidence
+                        thresholds = [0.8, 0.6]
+                        used_threshold = None
                         
-                        # Assign labels
-                        all_feats_df, labeled_count, stats = assign_scl_labels(
-                            all_feats_df,
-                            st.session_state.segments,
-                            scl_segmented,
-                            class_mapping,
-                            confidence_threshold=0.8,
-                            max_training_percentage=0.3
-                        )
+                        for th in thresholds:
+                            all_feats_df, labeled_count, stats = assign_scl_labels(
+                                all_feats_df,
+                                st.session_state.segments,
+                                scl_segmented,
+                                class_mapping,
+                                confidence_threshold=th,
+                                max_training_percentage=0.3
+                            )
+                            
+                            if labeled_count > 0:
+                                used_threshold = th
+                                break
                         
                         if labeled_count == 0:
-                            st.error("No training samples found! Try different SCL values or lower confidence.")
+                            st.error("No training samples found even with relaxed confidence.")
                         else:
                             # Show training stats
-                            st.success(f"✓ Training samples: {labeled_count}/{len(all_feats_df)} ({labeled_count/len(all_feats_df)*100:.1f}%)")
-                            
-                            for class_id, stat in stats.items():
-                                st.write(f"**{class_names[class_id]}**: {stat['selected']}/{stat['available']} segments (confidence: {stat['avg_confidence']:.2f})")
+                            st.session_state.classification_stats = stats
+                            st.session_state.used_confidence = used_threshold
+                            st.session_state.training_count = labeled_count
                             
                             # Train
                             clf, all_feats_df = train_classifier(all_feats_df)
                             
                             if clf is not None:
-                                st.success(f"✓ Model trained! OOB Score: {clf.oob_score_:.3f}")
+                                st.session_state.model_accuracy = clf.oob_score_
                                 
                                 # Map to image
                                 classification_rgb = map_classification_to_image(
@@ -1092,9 +1506,7 @@ if st.session_state.step == 5:
                                 # Store results
                                 st.session_state.clf = clf
                                 st.session_state.classification_results = classification_rgb
-                                st.session_state.class_mapping = class_mapping
-                                st.session_state.class_names = class_names
-                                st.session_state.class_colors = class_colors
+                                st.session_state.all_feats_df = all_feats_df
                                 
                                 st.rerun()
                     
@@ -1102,58 +1514,334 @@ if st.session_state.step == 5:
                         st.error(f"Classification failed: {e}")
                         import traceback
                         st.code(traceback.format_exc())
+        
+        except Exception as e:
+            st.error(f"Could not extract SCL data: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+        
+        # Show results if available
+        if st.session_state.classification_results is not None:
+            st.markdown("---")
+            st.markdown("### Training Summary")
             
-            # Step 3: Show results
-            if st.session_state.classification_results is not None:
-                st.markdown("### 3. Classification Result")
-                
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 7))
-                
-                # Original
-                ax1.imshow(st.session_state.rgb_full)
-                ax1.set_title("Original RGB")
-                ax1.axis('off')
-                
-                # Classification
-                ax2.imshow(st.session_state.classification_results)
-                ax2.set_title("AI Classification")
-                ax2.axis('off')
-                
-                # Legend
-                patches = [
-                    mpatches.Patch(color=st.session_state.class_colors[i], 
-                                  label=st.session_state.class_names[i])
-                    for i in sorted(st.session_state.class_names.keys())
-                ]
-                ax2.legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left')
-                
-                plt.tight_layout()
-                st.pyplot(fig)
-        else:
-            st.session_state.classification_enabled = False
-
-    # Navigation buttons
+            st.success(
+                f"Found {st.session_state.training_count} training samples "
+                f"({st.session_state.training_count/len(st.session_state.all_feats_df)*100:.1f}% of segments) "
+                f"using SCL confidence ≥ {st.session_state.used_confidence} | "
+                f"Model accuracy: {st.session_state.model_accuracy:.1%}"
+            )
+            
+            with st.expander("Training Details", expanded=False):
+                for class_id, stat in st.session_state.classification_stats.items():
+                    st.write(
+                        f"**{available_classes[class_id]['name']}**: "
+                        f"{stat['selected']} segments (confidence: {stat['avg_confidence']:.1%})"
+                    )
+            
+            st.markdown("### Classification Results")
+            
+            # Legend above the image
+            st.markdown("**Legend:**")
+            
+            # Get class info from stored data
+            scl, scl_segmented = extract_scl_from_file(
+                st.session_state.full_path, 
+                st.session_state.segments
+            )
+            available_classes = get_available_classes(scl_segmented)
+            
+            leg_cols = st.columns(len(available_classes))
+            for i, (class_id, class_info) in enumerate(available_classes.items()):
+                with leg_cols[i]:
+                    color = class_info['color']
+                    st.color_picker(
+                        class_info['name'], 
+                        value=f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}",
+                        disabled=True,
+                        key=f"legend_ml_{class_id}"
+                    )
+            
+            # Display only the classification image
+            st.image(
+                st.session_state.classification_results,
+                width='stretch'
+            )
+            
+            # Statistics below image
+            st.markdown("### Classification Statistics")
+            
+            pred_counts = st.session_state.all_feats_df['prediction'].value_counts().sort_index()
+            
+            cols = st.columns(len(available_classes))
+            for i, (class_id, class_info) in enumerate(available_classes.items()):
+                with cols[i]:
+                    count = pred_counts.get(class_id, 0)
+                    percentage = (count / len(st.session_state.all_feats_df)) * 100
+                    st.metric(class_info['name'], f"{percentage:.1f}%", f"{count} segments", delta_color="off", delta_arrow="off")
+                    
+            st.markdown("---")
+            st.subheader("Would you like to know how this place changed in the last decade?")
+            if st.button("Yes, show me the changes!", type="primary", width='stretch'):
+                st.session_state.step = 7
+                st.session_state.comparison_complete = False  # Reset comparison state
+                st.rerun()
+    
+    # Navigation
     st.markdown("---")
     col1, col2, col3 = st.columns(3)
-
+    
     with col1:
+        if st.button("Back to segmentation"):
+            st.session_state.step = 5
+            st.session_state.classification_method = None
+            st.session_state.classification_results = None
+            st.rerun()
+    
+    with col2:
         if st.button("Change parameters"):
             st.session_state.step = 3
             st.session_state.seg_vis = None
             st.session_state.seg_params = None
             st.session_state.segments = None
+            st.session_state.classification_method = None
             st.session_state.classification_results = None
             st.rerun()
+    
+    with col3:
+        if st.button("Change location"):
+            reset_to_step_one()
+        
+# -----------------------------
+# STEP 7: Past Comparison
+# -----------------------------
+if st.session_state.step == 7:
+    # Only run calculations if not already complete
+    if not st.session_state.comparison_complete:
+        # Clear everything and show only loading messages
+        st.empty()
+        
+        st.subheader(f"Analyzing changes between {st.session_state.old_date} and {st.session_state.recent_date}")
+        
+        # Check if the old image download is still in progress
+        if "download_future_old" in st.session_state and st.session_state.download_future_old:
+            with st.spinner(f"{random.choice(mythical_humanoids)} are traveling through time to gather intel..."):
+                try:
+                    # Wait for the old image download to complete
+                    old_path, old_date = st.session_state.download_future_old.result()
+                    if old_path is not None:
+                        st.session_state.old_path = old_path
+                        st.session_state.old_date = old_date
+                        rgb_old, ndvi_old = load_sentinel_data(old_path)
+                        st.session_state.rgb_old = rgb_old
+                        st.session_state.ndvi_old = ndvi_old
+                    else:
+                        st.error("Historical image download failed. Cannot proceed with comparison.")
+                        st.stop()
+                    del st.session_state.download_future_old
+                except Exception as e:
+                    st.error(f"Error while downloading the historical image: {e}")
+                    st.stop()
 
+        # Check if old image data exists
+        if st.session_state.rgb_old is None or st.session_state.ndvi_old is None:
+            st.error("Historical image data is missing. Please ensure the image was downloaded correctly.")
+            st.stop()
+
+        # Load the old image data
+        rgb_old = st.session_state.rgb_old
+        ndvi_old = st.session_state.ndvi_old
+
+        # Segment the old image using the same method as the recent image
+        with st.spinner(f"{random.choice(mythical_humanoids)} are analyzing the historical image..."):
+            try:
+                if st.session_state.seg_method == "clustering":
+                    segments_old = slic(
+                        rgb_old,
+                        n_segments=int(st.session_state.n_segments),
+                        compactness=float(st.session_state.compactness),
+                        start_label=1
+                    )
+                elif st.session_state.seg_method == "otsu":
+                    threshold = float(st.session_state.ndvi_threshold)
+                    mask_old = ndvi_old > threshold
+                    k = int(st.session_state.median_window)
+                    structuring_element = footprint_rectangle((k, k))
+                    filtered_mask_old = skimage.filters.median(mask_old, structuring_element)
+                    
+                    # Label both foreground AND background regions
+                    binary_old = filtered_mask_old.astype(bool)
+                    foreground_labels_old = sk_label(binary_old, connectivity=2)
+                    background_labels_old = sk_label(~binary_old, connectivity=2)
+                    max_fg_label_old = foreground_labels_old.max()
+                    segments_old = foreground_labels_old.copy()
+                    segments_old[background_labels_old > 0] = background_labels_old[background_labels_old > 0] + max_fg_label_old
+                    
+                elif st.session_state.seg_method == "region_based":
+                    if st.session_state.ws_input == "ndvi":
+                        ndvi_smooth_old = smooth_for_watershed(ndvi_old, sigma=1.5)
+                        ndvi_quant_old = quantize_for_watershed(ndvi_smooth_old, levels=32)
+                        gray_u8_old = array_to_uint8_gray(ndvi_quant_old)
+                    else:
+                        gray_old = rgb2gray(rgb_old)
+                        gray_smooth_old = smooth_for_watershed(gray_old, sigma=1.5)
+                        gray_quant_old = quantize_for_watershed(gray_smooth_old, levels=32)
+                        gray_u8_old = array_to_uint8_gray(gray_quant_old)
+                    labels_old = watershed_segmentation(gray_u8_old)
+                    labels_old = merge_small_regions(labels_old, min_size=int(st.session_state.ws_min_region))
+                    labels_old = fix_watershed_boundaries(labels_old)
+                    segments_old = labels_old
+
+                # Classify the old image using the same method as the recent image
+                if st.session_state.classification_method == "rule_based":
+                    classification_rgb_old, all_feats_df_old, _ = rule_based_classification(segments_old, ndvi_old)
+                    # Add prediction column for consistency
+                    all_feats_df_old['prediction'] = all_feats_df_old['class']
+                elif st.session_state.classification_method == "ml":
+                    all_feats_df_old = extract_features_for_classification(segments_old, rgb_old, ndvi_old)
+                    scl_old, scl_segmented_old = extract_scl_from_file(st.session_state.old_path, segments_old)
+                    all_feats_df_old, _, _ = assign_scl_labels(
+                        all_feats_df_old,
+                        segments_old,
+                        scl_segmented_old,
+                        st.session_state.class_mapping,
+                        confidence_threshold=0.8,
+                        max_training_percentage=0.3
+                    )
+                    clf_old, all_feats_df_old = train_classifier(all_feats_df_old)
+                    classification_rgb_old = map_classification_to_image(segments_old, all_feats_df_old, st.session_state.class_colors)
+
+                # Store in session state
+                st.session_state.segments_old = segments_old
+                st.session_state.all_feats_df_old = all_feats_df_old
+                st.session_state.classification_rgb_old = classification_rgb_old
+
+            except Exception as e:
+                st.error(f"Error during segmentation/classification: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+                st.stop()
+
+        # Extract SCL for both images
+        scl_new, scl_segmented_new = extract_scl_from_file(st.session_state.full_path, st.session_state.segments)
+        scl_old, scl_segmented_old = extract_scl_from_file(st.session_state.old_path, st.session_state.segments_old)
+        
+        # Define bad SCL classes (clouds)
+        BAD_SCL = {8, 9}
+        
+        # Create segment-level masks for bad SCL values
+        def create_segment_bad_mask(segments, scl_segmented, bad_scl_set):
+            """Create a boolean mask at segment level based on SCL values."""
+            bad_mask = np.zeros(segments.shape, dtype=bool)
+            unique_segments = np.unique(segments)
+            
+            for seg_id in unique_segments:
+                seg_mask = (segments == seg_id)
+                seg_scl_values = scl_segmented[seg_mask]
+                # Check if majority of pixels in segment have bad SCL
+                if len(seg_scl_values) > 0:
+                    unique_vals, counts = np.unique(seg_scl_values, return_counts=True)
+                    most_common = unique_vals[np.argmax(counts)]
+                    if most_common in bad_scl_set:
+                        bad_mask[seg_mask] = True
+            
+            return bad_mask
+        
+        bad_new = create_segment_bad_mask(st.session_state.segments, scl_segmented_new, BAD_SCL)
+        bad_old = create_segment_bad_mask(st.session_state.segments_old, scl_segmented_old, BAD_SCL)
+        bad_final = bad_new | bad_old
+        
+        # Create segment prediction arrays
+        def create_segment_prediction_array(segments, all_feats_df):
+            """Create array mapping segment IDs to predictions."""
+            seg_to_pred = dict(zip(all_feats_df['indx'], all_feats_df['prediction']))
+            prediction_img = np.zeros_like(segments, dtype=int)
+            for seg_id, pred in seg_to_pred.items():
+                prediction_img[segments == seg_id] = pred
+            return prediction_img
+        
+        prediction_new_img = create_segment_prediction_array(st.session_state.segments, st.session_state.all_feats_df)
+        prediction_old_img = create_segment_prediction_array(st.session_state.segments_old, st.session_state.all_feats_df_old)
+        
+        # Apply mask to exclude bad areas
+        valid_mask = ~bad_final
+        prediction_new_filtered = prediction_new_img[valid_mask]
+        prediction_old_filtered = prediction_old_img[valid_mask]
+
+        def class_percentages(prediction, class_names):
+            values, counts = np.unique(prediction, return_counts=True)
+            total = counts.sum()
+            out = {}
+            for v, c in zip(values, counts):
+                out[int(v)] = {
+                    "label": class_names.get(int(v), "Unknown"),
+                    "count": int(c),
+                    "percentage": 100 * c / total
+                }
+            return out, total
+
+        # Calculate statistics using filtered data
+        old_stats, old_total = class_percentages(prediction_old_filtered, st.session_state.class_names)
+        new_stats, new_total = class_percentages(prediction_new_filtered, st.session_state.class_names)
+
+        # Detect changes between old and new classifications
+        changed_mask = valid_mask & (prediction_old_img != prediction_new_img)
+        old_vals = prediction_old_img[changed_mask]
+        new_vals = prediction_new_img[changed_mask]
+        pairs, counts = np.unique(
+            np.stack([old_vals, new_vals], axis=1),
+            axis=0,
+            return_counts=True
+        )
+
+        # Store results in session state
+        st.session_state.old_stats = old_stats
+        st.session_state.new_stats = new_stats
+        st.session_state.changed_pairs = list(zip(pairs, counts))
+        st.session_state.total_changed = counts.sum()
+        st.session_state.valid_area_total = valid_mask.sum()
+        st.session_state.comparison_complete = True
+        
+        # Force rerun to display results
+        st.rerun()
+
+    # Display results (only runs after comparison_complete is True)
+    st.subheader(f"Change Detection: {st.session_state.old_date} vs {st.session_state.recent_date}")
+    
+    st.markdown(f"### Image from {st.session_state.old_date} - Statistics (Filtered)")
+    for k in sorted(st.session_state.old_stats):
+        v = st.session_state.old_stats[k]
+        st.write(f"Class {k:2d} ({v['label']:<22}): {v['count']:8d} px ({v['percentage']:6.2f}%)")
+    
+    st.markdown(f"### Image from {st.session_state.recent_date} - Statistics (Filtered)")
+    for k in sorted(st.session_state.new_stats):
+        v = st.session_state.new_stats[k]
+        st.write(f"Class {k:2d} ({v['label']:<22}): {v['count']:8d} px ({v['percentage']:6.2f}%)")
+    
+    st.markdown("### Class Changes (Filtered Area Only)")
+    st.write(f"Total changed pixels: {st.session_state.total_changed} ({100 * st.session_state.total_changed / st.session_state.valid_area_total:.2f}% of valid area)")
+    for (old_c, new_c), c in sorted(st.session_state.changed_pairs, key=lambda x: -x[1]):
+        st.write(
+            f"{int(old_c):2d} {st.session_state.class_names[int(old_c)]:<22} → "
+            f"{int(new_c):2d} {st.session_state.class_names[int(new_c)]:<22}: {int(c)} px ({100 * c / st.session_state.valid_area_total:.2f}%)"
+        )
+
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Back to Classification"):
+            st.session_state.step = 6
+            st.rerun()
     with col2:
-        if st.button("Change method"):
-            st.session_state.step = 2
+        if st.button("Change Parameters"):
+            st.session_state.step = 3
             st.session_state.seg_vis = None
             st.session_state.seg_params = None
             st.session_state.segments = None
+            st.session_state.classification_method = None
             st.session_state.classification_results = None
+            st.session_state.comparison_complete = False
             st.rerun()
-
     with col3:
-        if st.button("Change location"):
+        if st.button("Change Location"):
             reset_to_step_one()

@@ -13,6 +13,7 @@ from sklearn.ensemble import RandomForestClassifier
 from skimage.measure import regionprops_table, label as sk_label
 from skimage.morphology import footprint_rectangle
 from skimage.util import map_array
+import re
 import xarray as xr
 import os
 import pandas as pd
@@ -1849,4 +1850,5 @@ if st.session_state.step == 7:
     with col3:
         if st.button("Change Location"):
             reset_to_step_one()
+
 

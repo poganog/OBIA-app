@@ -794,10 +794,14 @@ def rule_based_classification(segments, ndvi):
 # -----------------------------
 if not st.session_state.username:
     st.subheader("Welcome! What should we call you?")
-    username = st.text_input("Enter your username or alias:")
+    username_raw = st.text_input("Enter your username or alias:")
+    
+    # Sanitize username for safety sake
+    safe_username = re.sub(r'[^\w\-]', '', username_raw)[:50]
+    
     if st.button("Submit username"):
-        if username:
-            st.session_state.username = username
+        if safe_username:
+            st.session_state.username = safe_username
             st.rerun()
         else:
             st.error("Please enter a username.")
@@ -1845,3 +1849,4 @@ if st.session_state.step == 7:
     with col3:
         if st.button("Change Location"):
             reset_to_step_one()
+

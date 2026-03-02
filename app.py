@@ -1,5 +1,4 @@
 import streamlit as st
-from geopy.geocoders import Nominatim
 import openeo
 import rasterio
 import numpy as np
@@ -16,6 +15,7 @@ from skimage.util import map_array
 import re
 import xarray as xr
 import os
+import glob
 import pandas as pd
 
 st.set_page_config(page_title="OBIA 4 EVER", layout="centered")
@@ -62,10 +62,7 @@ defaults = {
     "classification_stats": None,
     "used_confidence": None,
     "training_count": None,
-    "comparison_complete": False,   # NEW: track if comparison calculation is done
-    "segments_old": None,           # NEW: store old image segments
-    "all_feats_df_old": None,       # NEW: store old image features
-    "classification_rgb_old": None, # NEW: store old image classification
+    "location_name": None,  # NEW: store location display name
     
 }
 for key, value in defaults.items():
@@ -104,7 +101,7 @@ def download_sentinel_data(lat, lon, username, mode="recent", min_coverage=0.99)
         if mode == "recent":
             time_interval = ["2025-02-01", "2026-02-01"]
         elif mode == "oldest":
-            time_interval = ["2015-06-01", "2018-06-01"]
+            time_interval = ["2016-01-01", "2019-01-01"]
 
         # First, get a small sample to check available dates
         datacube = connection.load_collection(
@@ -263,10 +260,6 @@ def reset_after_coords():
     st.session_state.used_confidence = None
     st.session_state.training_count = None
     st.session_state.segments = None
-    st.session_state.comparison_complete = False
-    st.session_state.segments_old = None
-    st.session_state.all_feats_df_old = None
-    st.session_state.classification_rgb_old = None
     if "download_future_recent" in st.session_state:
         del st.session_state.download_future_recent
     if "download_future_old" in st.session_state:
@@ -294,6 +287,14 @@ def reset_to_step_one():
     st.session_state.step = 1
     reset_after_coords()
     st.rerun()
+    
+def reset_classification_state():
+    st.session_state.classification_results = None
+    st.session_state.classification_stats = None
+    st.session_state.all_feats_df = None
+    st.session_state.training_count = None
+    st.session_state.used_confidence = None
+    st.session_state.model_accuracy = None
 
 # -----------------------------
 # Watershed segmentation functions from https://github.com/manoharmukku/watershed-segmentation repository
@@ -807,81 +808,308 @@ if not st.session_state.username:
         else:
             st.error("Please enter a username.")
     st.stop()
-
+    
 # -----------------------------
-# STEP 1: Choose coordinates (or address)
+# STEP 1: Choose location (pre-loaded or custom)
 # -----------------------------
 if st.session_state.step == 1:
-    st.subheader("Enter the coordinates (decimal degrees) of your favorite place on Earth and see the magic happen!")
-
-    lat = st.text_input("Latitude")
-    lon = st.text_input("Longitude")
-
-    if st.button("Submit coordinates"):
-        if lat and lon:
-            try:
-                st.session_state.coords = (float(lat), float(lon))
-                reset_after_coords()
-                
-                # Start recent download first
-                executor = get_executor()
-                future_recent = executor.submit(download_sentinel_data, float(lat), float(lon), st.session_state.username, mode="recent")
-                
-                st.session_state.download_future_recent = future_recent
-                
-                st.session_state.step = 2
-                st.rerun()
-            except ValueError:
-                st.error("Please enter valid numbers.")
-
-    st.markdown("---")
-    if st.button("I'm not a nerd! I don't know coordinates by heart!"):
-        st.session_state.use_city_input = True
-        st.rerun()
-
-    if st.session_state.use_city_input:
-        st.subheader("Alternative: Enter city or street name")
-        st.session_state.city_name = st.text_input("Address", value=st.session_state.city_name)
-
-        if st.button("Submit address"):
-            if st.session_state.city_name:
-                geolocator = Nominatim(user_agent=st.session_state.username)
-                try:
-                    locations = geolocator.geocode(
-                        st.session_state.city_name, exactly_one=False, language="en"
-                    )
-                    if not locations:
-                        st.error("No results found.")
-                    else:
-                        st.session_state.locations = locations
-                        st.session_state.options = [
-                            f"{loc.address} → lat: {loc.latitude:.5f}, lon: {loc.longitude:.5f}"
-                            for loc in locations
-                        ]
-                except Exception as e:
-                    st.error(f"Geocoding service failed: {e}")
-
-        if "locations" in st.session_state and st.session_state.locations:
-            selected_option = st.radio(
-                "Choose the city:",
-                st.session_state.options,
-                index=st.session_state.selected_location
+    st.subheader("Choose a location")
+    
+    # Scan for pre-downloaded demo files
+    
+    demo_files = glob.glob("demo_data/*.tiff")
+    
+    DEMO_LOCATIONS = []
+    for file_path in demo_files:
+        # Extract name from filename (e.g., "demo_data/amazon_rainforest.tiff" -> "Amazon Rainforest")
+        filename = os.path.basename(file_path).replace('.tiff', '')
+        display_name = filename.replace('_', ' ').title()
+        
+        DEMO_LOCATIONS.append({
+            "name": display_name,
+            "file": file_path
+        })
+    
+    # Sort alphabetically
+    DEMO_LOCATIONS.sort(key=lambda x: x["name"])
+    
+    # Option selector
+    option = st.radio(
+        "Select an option:",
+        ["Choose from pre-loaded locations", "Choose your favorite place on Earth, instead!"],
+        index=0
+    )
+    
+    # =========================================================================
+    # OPTION 1: PRE-LOADED LOCATIONS
+    # =========================================================================
+    if option == "Choose from pre-loaded locations":
+        if len(DEMO_LOCATIONS) == 0:
+            st.error("No pre-loaded locations available. Please use custom coordinates.")
+        else:
+            location_names = [loc["name"] for loc in DEMO_LOCATIONS]
+            
+            selected_location = st.selectbox(
+                "Select a location:",
+                location_names
             )
-            if st.button("Confirm choice"):
-                index = st.session_state.options.index(selected_option)
-                chosen = st.session_state.locations[index]
-                st.session_state.coords = (chosen.latitude, chosen.longitude)
-                reset_after_coords()
+            
+            if st.button("Load location"):
+                # Find selected location data
+                loc_data = next(loc for loc in DEMO_LOCATIONS if loc["name"] == selected_location)
                 
-                # Start recent download first
-                executor = get_executor()
-                future_recent = executor.submit(download_sentinel_data, chosen.latitude, chosen.longitude, st.session_state.username, mode="recent")
+                file_path = loc_data["file"]
                 
-                st.session_state.download_future_recent = future_recent
-
+                if not os.path.exists(file_path):
+                    st.error(f"Demo file not found: {file_path}")
+                    st.stop()
+                
+                # Extract coordinates from the TIFF metadata if possible
+                try:
+                    with rasterio.open(file_path) as src:
+                        bounds = src.bounds
+                        # Calculate center
+                        center_lon = (bounds.left + bounds.right) / 2
+                        center_lat = (bounds.bottom + bounds.top) / 2
+                        st.session_state.coords = (center_lat, center_lon)
+                except:
+                    # Fallback if can't read metadata
+                    st.session_state.coords = (0, 0)
+                
+                # Store paths and location name
+                st.session_state.full_path = file_path
+                st.session_state.recent_date = "2025/26"  # Generic date since we don't have metadata
+                st.session_state.location_name = selected_location  # Store the display name
+                
+                # Load the image
+                with st.spinner(f"Loading {selected_location}..."):
+                    rgb, ndvi = load_sentinel_data(file_path)
+                    st.session_state.rgb_full = rgb
+                    st.session_state.ndvi = ndvi
+                
                 st.session_state.step = 2
                 st.rerun()
-
+    
+    # =========================================================================
+    # OPTION 2: CUSTOM COORDINATES (with fallback)
+    # =========================================================================
+    else:
+        st.markdown("### Enter the coordinates (decimal degrees) of your favorite place on Earth and see the magic happen!")
+        st.caption("Note: Downloads may fail due to API limits. If so, you'll be redirected to pre-loaded locations.")
+        
+        lat = st.text_input("Latitude")
+        lon = st.text_input("Longitude")
+        
+        if st.button("Submit coordinates"):
+            if not lat or not lon:
+                st.error("Please enter both latitude and longitude.")
+            else:
+                try:
+                    lat_val = float(lat)
+                    lon_val = float(lon)
+                    
+                    st.session_state.coords = (lat_val, lon_val)
+                    
+                    # Try to download
+                    download_message = f"{random.choice(mythical_humanoids)} are fetching your custom location..."
+                    
+                    with st.spinner(download_message):
+                        try:
+                            # Attempt download
+                            full_path, recent_date = download_sentinel_data(
+                                lat_val, lon_val, 
+                                st.session_state.username, 
+                                mode="recent",
+                                min_coverage=0.99
+                            )
+                            
+                            if full_path is None:
+                                raise Exception("Download returned no data")
+                            
+                            # Success!
+                            st.session_state.full_path = full_path
+                            st.session_state.recent_date = recent_date
+                            st.session_state.location_name = None  # No display name for custom
+                            
+                            rgb, ndvi = load_sentinel_data(full_path)
+                            st.session_state.rgb_full = rgb
+                            st.session_state.ndvi = ndvi
+                            
+                            st.success("Custom location loaded successfully!")
+                            st.session_state.step = 2
+                            st.rerun()
+                            
+                        except Exception as download_error:
+                            # Download failed - show error and offer fallback
+                            st.error(f"Download failed: {str(download_error)}")
+                            
+                            if len(DEMO_LOCATIONS) > 0:
+                                st.warning("Due to API rate limits, please choose from pre-loaded locations instead.")
+                                
+                                # Show quick selection
+                                st.markdown("---")
+                                st.markdown("### Available pre-loaded locations:")
+                                
+                                location_names = [loc["name"] for loc in DEMO_LOCATIONS]
+                                
+                                fallback_location = st.selectbox(
+                                    "Select a location:",
+                                    location_names,
+                                    key="fallback_selector"
+                                )
+                                
+                                if st.button("Load this location instead", key="fallback_button"):
+                                    loc_data = next(loc for loc in DEMO_LOCATIONS if loc["name"] == fallback_location)
+                                    
+                                    file_path = loc_data["file"]
+                                    
+                                    if os.path.exists(file_path):
+                                        # Extract coordinates from TIFF
+                                        try:
+                                            with rasterio.open(file_path) as src:
+                                                bounds = src.bounds
+                                                center_lon = (bounds.left + bounds.right) / 2
+                                                center_lat = (bounds.bottom + bounds.top) / 2
+                                                st.session_state.coords = (center_lat, center_lon)
+                                        except:
+                                            st.session_state.coords = (0, 0)
+                                        
+                                        st.session_state.full_path = file_path
+                                        st.session_state.recent_date = "2024-2025"
+                                        st.session_state.location_name = fallback_location  # Store location name
+                                        
+                                        rgb, ndvi = load_sentinel_data(file_path)
+                                        st.session_state.rgb_full = rgb
+                                        st.session_state.ndvi = ndvi
+                                        
+                                        st.session_state.step = 2
+                                        st.rerun()
+                            else:
+                                st.error("No fallback locations available. Please try again later.")
+                
+                except ValueError:
+                    st.error("Please enter valid numbers for latitude and longitude.")
+        
+        # The iconic button!
+        st.markdown("---")
+        if st.button("I'm not a nerd! I don't know coordinates by heart!"):
+            st.session_state.use_city_input = True
+            st.rerun()
+        
+        # Show address input if button was clicked
+        if st.session_state.get("use_city_input", False):
+            st.markdown("### Alternative: Enter city or street name")
+            city_name = st.text_input("Address", value=st.session_state.get("city_name", ""))
+            
+            if st.button("Submit address"):
+                if city_name:
+                    from geopy.geocoders import Nominatim
+                    geolocator = Nominatim(user_agent=st.session_state.username)
+                    
+                    try:
+                        locations = geolocator.geocode(city_name, exactly_one=False, language="en")
+                        
+                        if not locations:
+                            st.error("No results found for this address.")
+                        else:
+                            st.session_state.locations = locations
+                            st.session_state.options = [
+                                f"{loc.address} → lat: {loc.latitude:.5f}, lon: {loc.longitude:.5f}"
+                                for loc in locations
+                            ]
+                            st.session_state.city_name = city_name
+                            st.rerun()
+                    
+                    except Exception as e:
+                        st.error(f"Geocoding failed: {e}")
+            
+            # Show geocoding results if available
+            if "locations" in st.session_state and st.session_state.locations:
+                selected_option = st.radio(
+                    "Choose the city:",
+                    st.session_state.options,
+                    index=0
+                )
+                
+                if st.button("Confirm choice"):
+                    index = st.session_state.options.index(selected_option)
+                    chosen = st.session_state.locations[index]
+                    
+                    lat_val = chosen.latitude
+                    lon_val = chosen.longitude
+                    
+                    st.session_state.coords = (lat_val, lon_val)
+                    
+                    download_message = f"{random.choice(mythical_humanoids)} are fetching your location..."
+                    
+                    with st.spinner(download_message):
+                        try:
+                            full_path, recent_date = download_sentinel_data(
+                                lat_val, lon_val,
+                                st.session_state.username,
+                                mode="recent",
+                                min_coverage=0.99
+                            )
+                            
+                            if full_path is None:
+                                raise Exception("Download returned no data")
+                            
+                            st.session_state.full_path = full_path
+                            st.session_state.recent_date = recent_date
+                            st.session_state.location_name = None  # No display name for custom
+                            
+                            rgb, ndvi = load_sentinel_data(full_path)
+                            st.session_state.rgb_full = rgb
+                            st.session_state.ndvi = ndvi
+                            
+                            st.success("Location loaded successfully!")
+                            st.session_state.step = 2
+                            st.rerun()
+                            
+                        except Exception as download_error:
+                            st.error(f"Download failed: {str(download_error)}")
+                            
+                            if len(DEMO_LOCATIONS) > 0:
+                                st.warning("Due to API rate limits, please choose from pre-loaded locations instead.")
+                                
+                                st.markdown("---")
+                                st.markdown("### Available pre-loaded locations:")
+                                
+                                location_names = [loc["name"] for loc in DEMO_LOCATIONS]
+                                
+                                fallback_location = st.selectbox(
+                                    "Select a location:",
+                                    location_names,
+                                    key="fallback_selector_geocode"
+                                )
+                                
+                                if st.button("Load this location instead", key="fallback_button_geocode"):
+                                    loc_data = next(loc for loc in DEMO_LOCATIONS if loc["name"] == fallback_location)
+                                    
+                                    file_path = loc_data["file"]
+                                    
+                                    if os.path.exists(file_path):
+                                        # Extract coordinates from TIFF
+                                        try:
+                                            with rasterio.open(file_path) as src:
+                                                bounds = src.bounds
+                                                center_lon = (bounds.left + bounds.right) / 2
+                                                center_lat = (bounds.bottom + bounds.top) / 2
+                                                st.session_state.coords = (center_lat, center_lon)
+                                        except:
+                                            st.session_state.coords = (0, 0)
+                                        
+                                        st.session_state.full_path = file_path
+                                        st.session_state.recent_date = "2024-2025"
+                                        st.session_state.location_name = fallback_location  # Store location name
+                                        
+                                        rgb, ndvi = load_sentinel_data(file_path)
+                                        st.session_state.rgb_full = rgb
+                                        st.session_state.ndvi = ndvi
+                                        
+                                        st.session_state.step = 2
+                                        st.rerun()
+    
     st.stop()
 
 # -----------------------------
@@ -933,7 +1161,7 @@ if st.session_state.step == 3:
 
     if st.session_state.seg_method == "clustering":
         # NEW: short explanations
-        st.caption('SLIC settings: control how many “superpixels” (segments) you get and how “compact” their shapes are.')
+        st.caption("SLIC settings: control how many “superpixels” (segments) you get and how “compact” their shapes are.")
         with st.form("seg_params_form"):
             compactness = st.slider("Compactness", 0.1, 50.0, float(st.session_state.compactness))
             st.caption("Compactness: high compactness = more square/regular segments, lower compactness = segments stick more to image boundaries.")
@@ -949,7 +1177,7 @@ if st.session_state.step == 3:
 
     elif st.session_state.seg_method == "otsu":
         # NEW: short explanations
-        st.caption("NDVI (Normalized Difference Vegetation Index) thresholding: binary mask that separates pixels into two groups (above threshold vs below). You can set the threshold manually or let Otsu's method find an optimal value automatically.")
+        st.caption("NDVI (Normalized Difference Vegetation Index) thresholding: binary mask that separates pixels into two groups (above threshold vs below). You can set the threshold manually or let Otsu’s method find an optimal value automatically.")
         with st.form("otsu_params_form"):
             ndvi_threshold = st.slider("NDVI threshold", -1.0, 1.0, float(st.session_state.ndvi_threshold), step=0.01)
             st.caption("NDVI threshold: pixels above this value are usually vegetation.")
@@ -1016,9 +1244,17 @@ if st.session_state.step == 4:
 
     # If we already fetched, just show it
     if st.session_state.rgb_full is not None:
+        # Create caption with location name instead of coordinates
+        if st.session_state.location_name:
+            caption = f"{st.session_state.location_name} - {st.session_state.recent_date}"
+        else:
+            # Fallback for custom downloads (use coordinates)
+            lat, lon = st.session_state.coords
+            caption = f"({lat:.5f}, {lon:.5f}) - {st.session_state.recent_date}"
+        
         st.image(
             st.session_state.rgb_full,
-            caption=f"Image from {st.session_state.recent_date} ({lat:.5f}, {lon:.5f})",
+            caption=caption,
             width='stretch'
         )
 
@@ -1046,37 +1282,12 @@ if st.session_state.step == 4:
                     # Clear the recent future
                     del st.session_state.download_future_recent
                     
-                    # Now start the old image download
-                    if "download_future_old" not in st.session_state:
-                        executor = get_executor()
-                        future_old = executor.submit(download_sentinel_data, lat, lon, st.session_state.username, mode="oldest")
-                        st.session_state.download_future_old = future_old
-                    
                     st.rerun()
 
                 except Exception as e:
                     st.error(f"Background task failed: {e}")
                     st.stop()
-        # Check if old image download is in progress or complete
-        elif ("download_future_old" in st.session_state and st.session_state.download_future_old):
-            with st.spinner("Downloading oldest image..."):
-                try:
-                    old_path, old_date = st.session_state.download_future_old.result()
-                    if old_path is not None:
-                        st.session_state.old_path = old_path
-                        st.session_state.old_date = old_date
-                        rgb_old, ndvi_old = load_sentinel_data(old_path)
-                        st.session_state.rgb_old = rgb_old
-                        st.session_state.ndvi_old = ndvi_old
-                    
-                    del st.session_state.download_future_old
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"Old image download failed: {e}")
-                    # Continue anyway with just the recent image
-                    del st.session_state.download_future_old
-                    st.rerun()
+        
         else:
              st.error("No download task found. Please restart.")
              st.stop()
@@ -1193,27 +1404,34 @@ if st.session_state.step == 5:
 
         st.session_state.seg_vis = seg_vis
 
-    # Display segmentation
+    # Display segmentation (use name in the legend, if available, otherwise coordinates)
+    if st.session_state.location_name:
+        location_str = st.session_state.location_name
+    else:
+        lat, lon = st.session_state.coords
+        location_str = f"({lat:.5f}, {lon:.5f})"
+    
+    # Display segmentation with location name
     if st.session_state.seg_params.get("method") == "clustering":
         caption = (
-            f"({lat:.5f}, {lon:.5f}) | n_segments={st.session_state.seg_params['n_segments']}, "
+            f"{location_str} | n_segments={st.session_state.seg_params['n_segments']}, "
             f"compactness={st.session_state.seg_params['compactness']} | "
             f"{st.session_state.recent_date}"
         )
     elif st.session_state.seg_params.get("method") in ["otsu_ndvi", "otsu_ndvi_auto"]:
         caption = (
-            f"({lat:.5f}, {lon:.5f}) | NDVI threshold={st.session_state.seg_params['threshold']:.2f} | "
+            f"{location_str} | NDVI threshold={st.session_state.seg_params['threshold']:.2f} | "
             f"median={st.session_state.seg_params['median_window']} | "
             f"mode={'auto (Otsu)' if st.session_state.seg_params.get('method') == 'otsu_ndvi_auto' else 'manual'} | "
             f"{st.session_state.recent_date}"
         )
     elif st.session_state.seg_params.get("method") == "watershed_repo":
         caption = (
-            f"({lat:.5f}, {lon:.5f}) | method=watershed | input={st.session_state.seg_params.get('input')} | "
+            f"{location_str} | method=watershed | input={st.session_state.seg_params.get('input')} | "
             f"{st.session_state.recent_date}"
         )
     else:
-        caption = f"({lat:.5f}, {lon:.5f}) | method={st.session_state.seg_params.get('method')} | {st.session_state.recent_date}"
+        caption = f"{location_str} | method={st.session_state.seg_params.get('method')} | {st.session_state.recent_date}"
 
     st.image(st.session_state.seg_vis, caption=caption, width='stretch')
 
@@ -1276,135 +1494,21 @@ if st.session_state.step == 6:
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("Machine Learning", width='stretch', type="primary" if st.session_state.classification_method != "rule_based" else "secondary"):
+        if st.button("Machine Learning", width='stretch', type="primary"):
+            reset_classification_state()
             st.session_state.classification_method = "ml"
-            st.session_state.classification_results = None
             st.rerun()
     
     with col2:
-        if st.button("Rule-Based", width='stretch', type="primary" if st.session_state.classification_method == "rule_based" else "secondary"):
+        if st.button("Rule-Based (NDVI)", width='stretch'):
+            reset_classification_state()
             st.session_state.classification_method = "rule_based"
-            st.session_state.classification_results = None
             st.rerun()
-    
-    # ========================================================================
-    # RULE-BASED CLASSIFICATION
-    # ========================================================================
-    if st.session_state.classification_method == "rule_based":
-        st.markdown("---")
-        st.markdown("### Rule-Based Classification")
-        
-        st.info("""
-        The algorithm uses NDVI thresholds to classify land cover:
-        - **Water**: NDVI < -0.25 (Blue)
-        - **Vegetation**: NDVI > 0.45 (Green)
-        - **No-Vegetation**: -0.25 ≤ NDVI ≤ 0.45 (Yellow)
-        """)
-        
-        # Run classification button
-        if st.button("Run Classification", width='stretch', type="primary"):
-            classification_message = f"{random.choice(mythical_humanoids)} are classifying your image..."
-            
-            with st.spinner(classification_message):
-                try:
-                    # Run rule-based classification
-                    result_rgb, all_feats_df, max_ndvi = rule_based_classification(
-                        st.session_state.segments,
-                        st.session_state.ndvi
-                    )
-                    
-                    # Store results - add 'prediction' column for consistency
-                    all_feats_df['prediction'] = all_feats_df['class']
-                    st.session_state.classification_results = result_rgb
-                    st.session_state.all_feats_df = all_feats_df
-                    st.session_state.max_ndvi = max_ndvi
-                    
-                    st.rerun()
-                
-                except Exception as e:
-                    st.error(f"Classification failed: {e}")
-                    import traceback
-                    st.code(traceback.format_exc())
-        
-        # Show results if available
-        if st.session_state.classification_results is not None:
-            st.markdown("---")
-            st.markdown("### Classification Results")
-            
-            # Legend above the image
-            st.markdown("**Legend:**")
-            leg_cols = st.columns(3)
-            
-            class_info_legend = {
-                4: {"name": "Vegetation", "color": [0.0, 0.6, 0.0]},
-                5: {"name": "No-Vegetation", "color": [1.0, 0.9, 0.4]},
-                6: {"name": "Water", "color": [0.0, 0.0, 0.7]}
-            }
-            
-            st.session_state.class_names = {
-                4: "Vegetation",
-                5: "No-Vegetation",
-                6: "Water"
-            }
-            
-            for i, (class_id, info) in enumerate(class_info_legend.items()):
-                with leg_cols[i]:
-                    color = info['color']
-                    st.color_picker(
-                        info['name'], 
-                        value=f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}",
-                        disabled=True,
-                        key=f"legend_rule_{class_id}"
-                    )
-            
-            # Display the classification image
-            st.image(
-                st.session_state.classification_results,
-                width='stretch'
-            )
-            
-            # Statistics below image
-            st.markdown("### Classification Statistics")
-            
-            # Calculate percentages for each class
-            class_counts = st.session_state.all_feats_df['class'].value_counts()
-            total_segments = len(st.session_state.all_feats_df)
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                veg_count = class_counts.get(4, 0)
-                veg_pct = (veg_count / total_segments) * 100
-                st.metric("Vegetation", f"{veg_pct:.1f}%", f"{veg_count} segments", delta_color="off", delta_arrow="off")
-            
-            with col2:
-                no_veg_count = class_counts.get(5, 0)
-                no_veg_pct = (no_veg_count / total_segments) * 100
-                st.metric("No-Vegetation", f"{no_veg_pct:.1f}%", f"{no_veg_count} segments", delta_color="off", delta_arrow="off")
-            
-            with col3:
-                water_count = class_counts.get(6, 0)
-                water_pct = (water_count / total_segments) * 100
-                st.metric("Water", f"{water_pct:.1f}%", f"{water_count} segments", delta_color="off", delta_arrow="off")
-            
-            # Additional info
-            st.markdown("---")
-            st.info(f"**Maximum NDVI in image**: {st.session_state.max_ndvi:.4f}")
-            
-            if st.session_state.max_ndvi <= 0.45:
-                st.warning("⚠️ The maximum NDVI is below 0.45, so no vegetation was detected. This is expected for areas with minimal plant life.")
-    
-            st.markdown("---")
-            st.subheader("Would you like to know how this place changed in the last decade?")
-            if st.button("Yes, show me the changes!", type="primary", width='stretch'):
-                st.session_state.step = 7
-                st.session_state.comparison_complete = False  # Reset comparison state
-                st.rerun()
     
     # ========================================================================
     # MACHINE LEARNING CLASSIFICATION
     # ========================================================================
-    elif st.session_state.classification_method == "ml":
+    if st.session_state.classification_method == "ml":
         st.markdown("---")
         st.markdown("### Machine Learning Classification")
         
@@ -1426,35 +1530,15 @@ if st.session_state.step == 6:
             if len(available_classes) == 0:
                 st.error("No suitable land cover types detected in this image. The image may be mostly clouds or defective pixels.")
                 st.stop()
-            
-            # Show available classes
-            st.markdown("**Classes to be identified:**")
-            cols = st.columns(len(available_classes))
-            
+                    
             class_mapping = {}
             class_names = {}
             class_colors = {}
             
             for i, (class_id, class_info) in enumerate(available_classes.items()):
-                with cols[i]:
-                    st.markdown(f"**{class_info['name']}**")
-                    color = class_info['color']
-                    st.color_picker(
-                        "Color", 
-                        value=f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}",
-                        disabled=True,
-                        key=f"color_preview_{class_id}"
-                    )
-                
                 class_mapping[class_id] = class_info['scl_values']
                 class_names[class_id] = class_info['name']
                 class_colors[class_id] = class_info['color']
-                
-                st.session_state.class_mapping = class_mapping
-                st.session_state.class_names = class_names
-                st.session_state.class_colors = class_colors
-            
-            st.markdown("---")
             
             # Run classification button
             if st.button("Run Classification", width='stretch', type="primary"):
@@ -1530,42 +1614,24 @@ if st.session_state.step == 6:
             st.markdown("---")
             st.markdown("### Training Summary")
             
-            st.success(
-                f"Found {st.session_state.training_count} training samples "
-                f"({st.session_state.training_count/len(st.session_state.all_feats_df)*100:.1f}% of segments) "
-                f"using SCL confidence ≥ {st.session_state.used_confidence} | "
-                f"Model accuracy: {st.session_state.model_accuracy:.1%}"
-            )
+            # Fix: Check if training_count exists and is not None
+            if st.session_state.training_count and st.session_state.all_feats_df is not None:
+                st.success(
+                    f"Found {st.session_state.training_count} training samples "
+                    f"({st.session_state.training_count/len(st.session_state.all_feats_df)*100:.1f}% of segments) "
+                    f"using SCL confidence ≥ {st.session_state.used_confidence} | "
+                    f"Model accuracy: {st.session_state.model_accuracy:.1%}"
+                )
             
             with st.expander("Training Details", expanded=False):
-                for class_id, stat in st.session_state.classification_stats.items():
-                    st.write(
-                        f"**{available_classes[class_id]['name']}**: "
-                        f"{stat['selected']} segments (confidence: {stat['avg_confidence']:.1%})"
-                    )
+                if st.session_state.classification_stats:
+                    for class_id, stat in st.session_state.classification_stats.items():
+                        st.write(
+                            f"**{available_classes[class_id]['name']}**: "
+                            f"{stat['selected']} segments (confidence: {stat['avg_confidence']:.1%})"
+                        )
             
             st.markdown("### Classification Results")
-            
-            # Legend above the image
-            st.markdown("**Legend:**")
-            
-            # Get class info from stored data
-            scl, scl_segmented = extract_scl_from_file(
-                st.session_state.full_path, 
-                st.session_state.segments
-            )
-            available_classes = get_available_classes(scl_segmented)
-            
-            leg_cols = st.columns(len(available_classes))
-            for i, (class_id, class_info) in enumerate(available_classes.items()):
-                with leg_cols[i]:
-                    color = class_info['color']
-                    st.color_picker(
-                        class_info['name'], 
-                        value=f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}",
-                        disabled=True,
-                        key=f"legend_ml_{class_id}"
-                    )
             
             # Display only the classification image
             st.image(
@@ -1576,6 +1642,13 @@ if st.session_state.step == 6:
             # Statistics below image
             st.markdown("### Classification Statistics")
             
+            # Get class info from stored data
+            scl, scl_segmented = extract_scl_from_file(
+                st.session_state.full_path, 
+                st.session_state.segments
+            )
+            available_classes = get_available_classes(scl_segmented)
+            
             pred_counts = st.session_state.all_feats_df['prediction'].value_counts().sort_index()
             
             cols = st.columns(len(available_classes))
@@ -1584,13 +1657,165 @@ if st.session_state.step == 6:
                     count = pred_counts.get(class_id, 0)
                     percentage = (count / len(st.session_state.all_feats_df)) * 100
                     st.metric(class_info['name'], f"{percentage:.1f}%", f"{count} segments", delta_color="off", delta_arrow="off")
-                    
+            
+            # Color legend
             st.markdown("---")
-            st.subheader("Would you like to know how this place changed in the last decade?")
-            if st.button("Yes, show me the changes!", type="primary", width='stretch'):
-                st.session_state.step = 7
-                st.session_state.comparison_complete = False  # Reset comparison state
-                st.rerun()
+            st.markdown("### Color Legend")
+            cols = st.columns(len(available_classes))
+            for i, (class_id, class_info) in enumerate(available_classes.items()):
+                with cols[i]:
+                    color = class_info['color']
+                    st.color_picker(
+                        class_info['name'], 
+                        value=f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}",
+                        disabled=True,
+                        key=f"legend_color_{class_id}"
+                    )
+    
+    # ========================================================================
+    # RULE-BASED CLASSIFICATION
+    # ========================================================================
+    elif st.session_state.classification_method == "rule_based":
+        st.markdown("---")
+        st.markdown("### Rule-Based Classification (NDVI Thresholds)")
+        
+        st.info("""
+        This method classifies land cover based on NDVI values:
+        - **Water**: NDVI < -0.25
+        - **Vegetation**: NDVI > 0.45
+        - **No-Vegetation** (Urban/Bare Soil): NDVI between -0.25 and 0.45
+        """)
+        
+        # Run classification button
+        if st.button("Run Rule-Based Classification", width='stretch', type="primary"):
+            classification_message = f"{random.choice(mythical_humanoids)} are classifying your image..."
+            
+            with st.spinner(classification_message):
+                try:
+                    # Perform rule-based classification
+                    classification_rgb, all_feats_df, max_ndvi = rule_based_classification(
+                        st.session_state.segments,
+                        st.session_state.ndvi
+                    )
+                    
+                    # Calculate statistics
+                    class_counts = all_feats_df['class'].value_counts()
+                    total = len(all_feats_df)
+                    
+                    class_stats = {
+                        'vegetation': {
+                            'count': int(class_counts.get(4, 0)),
+                            'percentage': float(class_counts.get(4, 0) / total * 100)
+                        },
+                        'no_vegetation': {
+                            'count': int(class_counts.get(5, 0)),
+                            'percentage': float(class_counts.get(5, 0) / total * 100)
+                        },
+                        'water': {
+                            'count': int(class_counts.get(6, 0)),
+                            'percentage': float(class_counts.get(6, 0) / total * 100)
+                        },
+                        'max_ndvi': float(max_ndvi)
+                    }
+                    
+                    # Store results
+                    st.session_state.classification_results = classification_rgb
+                    st.session_state.all_feats_df = all_feats_df
+                    st.session_state.classification_stats = class_stats
+                    
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"Classification failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+        
+        # Show results if available
+        if st.session_state.classification_results is not None:
+            st.markdown("---")
+            st.markdown("### Classification Results")
+            
+            # Display classification image
+            st.image(
+                st.session_state.classification_results,
+                caption="Rule-Based Classification (NDVI Thresholds)",
+                width='stretch'
+            )
+            
+            # Color legend
+            st.markdown("---")
+            st.markdown("### Legend")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.color_picker(
+                    "Vegetation", 
+                    value="#009900",  # RGB [0.0, 0.6, 0.0]
+                    disabled=True,
+                    key="legend_vegetation"
+                )
+            
+            with col2:
+                st.color_picker(
+                    "No-Vegetation", 
+                    value="#ffe666",  # RGB [1.0, 0.9, 0.4]
+                    disabled=True,
+                    key="legend_no_vegetation"
+                )
+            
+            with col3:
+                st.color_picker(
+                    "Water", 
+                    value="#0066b3",  # RGB [0.0, 0.4, 0.7]
+                    disabled=True,
+                    key="legend_water"
+                )
+            
+            # Statistics below image
+            st.markdown("### Classification Statistics")
+            
+            stats = st.session_state.classification_stats
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric(
+                    "Vegetation",
+                    f"{stats['vegetation']['percentage']:.1f}%",
+                    f"{stats['vegetation']['count']} segments",
+                    delta_color="off",
+                    delta_arrow="off"
+                )
+            
+            with col2:
+                st.metric(
+                    "No-Vegetation",
+                    f"{stats['no_vegetation']['percentage']:.1f}%",
+                    f"{stats['no_vegetation']['count']} segments",
+                    delta_color="off",
+                    delta_arrow="off"
+                )
+            
+            with col3:
+                st.metric(
+                    "Water",
+                    f"{stats['water']['percentage']:.1f}%",
+                    f"{stats['water']['count']} segments",
+                    delta_color="off",
+                    delta_arrow="off"
+                )
+            
+            # Additional info with thresholds
+            with st.expander("Classification Details", expanded=False):
+                st.write(f"**Maximum NDVI in image:** {stats['max_ndvi']:.4f}")
+                st.write("")
+                st.write("**Classification Thresholds:**")
+                st.write("- Vegetation: NDVI > 0.45")
+                st.write("- No-Vegetation: -0.25 ≤ NDVI ≤ 0.45")
+                st.write("- Water: NDVI < -0.25")
+                
+                if stats['max_ndvi'] <= 0.45:
+                    st.warning("Note: Since the maximum NDVI is below 0.45, no vegetation appears in this image.")
     
     # Navigation
     st.markdown("---")
@@ -1616,239 +1841,3 @@ if st.session_state.step == 6:
     with col3:
         if st.button("Change location"):
             reset_to_step_one()
-        
-# -----------------------------
-# STEP 7: Past Comparison
-# -----------------------------
-if st.session_state.step == 7:
-    # Only run calculations if not already complete
-    if not st.session_state.comparison_complete:
-        # Clear everything and show only loading messages
-        st.empty()
-        
-        st.subheader(f"Analyzing changes between {st.session_state.old_date} and {st.session_state.recent_date}")
-        
-        # Check if the old image download is still in progress
-        if "download_future_old" in st.session_state and st.session_state.download_future_old:
-            with st.spinner(f"{random.choice(mythical_humanoids)} are traveling through time to gather intel..."):
-                try:
-                    # Wait for the old image download to complete
-                    old_path, old_date = st.session_state.download_future_old.result()
-                    if old_path is not None:
-                        st.session_state.old_path = old_path
-                        st.session_state.old_date = old_date
-                        rgb_old, ndvi_old = load_sentinel_data(old_path)
-                        st.session_state.rgb_old = rgb_old
-                        st.session_state.ndvi_old = ndvi_old
-                    else:
-                        st.error("Historical image download failed. Cannot proceed with comparison.")
-                        st.stop()
-                    del st.session_state.download_future_old
-                except Exception as e:
-                    st.error(f"Error while downloading the historical image: {e}")
-                    st.stop()
-
-        # Check if old image data exists
-        if st.session_state.rgb_old is None or st.session_state.ndvi_old is None:
-            st.error("Historical image data is missing. Please ensure the image was downloaded correctly.")
-            st.stop()
-
-        # Load the old image data
-        rgb_old = st.session_state.rgb_old
-        ndvi_old = st.session_state.ndvi_old
-
-        # Segment the old image using the same method as the recent image
-        with st.spinner(f"{random.choice(mythical_humanoids)} are analyzing the historical image..."):
-            try:
-                if st.session_state.seg_method == "clustering":
-                    segments_old = slic(
-                        rgb_old,
-                        n_segments=int(st.session_state.n_segments),
-                        compactness=float(st.session_state.compactness),
-                        start_label=1
-                    )
-                elif st.session_state.seg_method == "otsu":
-                    threshold = float(st.session_state.ndvi_threshold)
-                    mask_old = ndvi_old > threshold
-                    k = int(st.session_state.median_window)
-                    structuring_element = footprint_rectangle((k, k))
-                    filtered_mask_old = skimage.filters.median(mask_old, structuring_element)
-                    
-                    # Label both foreground AND background regions
-                    binary_old = filtered_mask_old.astype(bool)
-                    foreground_labels_old = sk_label(binary_old, connectivity=2)
-                    background_labels_old = sk_label(~binary_old, connectivity=2)
-                    max_fg_label_old = foreground_labels_old.max()
-                    segments_old = foreground_labels_old.copy()
-                    segments_old[background_labels_old > 0] = background_labels_old[background_labels_old > 0] + max_fg_label_old
-                    
-                elif st.session_state.seg_method == "region_based":
-                    if st.session_state.ws_input == "ndvi":
-                        ndvi_smooth_old = smooth_for_watershed(ndvi_old, sigma=1.5)
-                        ndvi_quant_old = quantize_for_watershed(ndvi_smooth_old, levels=32)
-                        gray_u8_old = array_to_uint8_gray(ndvi_quant_old)
-                    else:
-                        gray_old = rgb2gray(rgb_old)
-                        gray_smooth_old = smooth_for_watershed(gray_old, sigma=1.5)
-                        gray_quant_old = quantize_for_watershed(gray_smooth_old, levels=32)
-                        gray_u8_old = array_to_uint8_gray(gray_quant_old)
-                    labels_old = watershed_segmentation(gray_u8_old)
-                    labels_old = merge_small_regions(labels_old, min_size=int(st.session_state.ws_min_region))
-                    labels_old = fix_watershed_boundaries(labels_old)
-                    segments_old = labels_old
-
-                # Classify the old image using the same method as the recent image
-                if st.session_state.classification_method == "rule_based":
-                    classification_rgb_old, all_feats_df_old, _ = rule_based_classification(segments_old, ndvi_old)
-                    # Add prediction column for consistency
-                    all_feats_df_old['prediction'] = all_feats_df_old['class']
-                elif st.session_state.classification_method == "ml":
-                    all_feats_df_old = extract_features_for_classification(segments_old, rgb_old, ndvi_old)
-                    scl_old, scl_segmented_old = extract_scl_from_file(st.session_state.old_path, segments_old)
-                    all_feats_df_old, _, _ = assign_scl_labels(
-                        all_feats_df_old,
-                        segments_old,
-                        scl_segmented_old,
-                        st.session_state.class_mapping,
-                        confidence_threshold=0.8,
-                        max_training_percentage=0.3
-                    )
-                    clf_old, all_feats_df_old = train_classifier(all_feats_df_old)
-                    classification_rgb_old = map_classification_to_image(segments_old, all_feats_df_old, st.session_state.class_colors)
-
-                # Store in session state
-                st.session_state.segments_old = segments_old
-                st.session_state.all_feats_df_old = all_feats_df_old
-                st.session_state.classification_rgb_old = classification_rgb_old
-
-            except Exception as e:
-                st.error(f"Error during segmentation/classification: {e}")
-                import traceback
-                st.code(traceback.format_exc())
-                st.stop()
-
-        # Extract SCL for both images
-        scl_new, scl_segmented_new = extract_scl_from_file(st.session_state.full_path, st.session_state.segments)
-        scl_old, scl_segmented_old = extract_scl_from_file(st.session_state.old_path, st.session_state.segments_old)
-        
-        # Define bad SCL classes (clouds)
-        BAD_SCL = {8, 9}
-        
-        # Create segment-level masks for bad SCL values
-        def create_segment_bad_mask(segments, scl_segmented, bad_scl_set):
-            """Create a boolean mask at segment level based on SCL values."""
-            bad_mask = np.zeros(segments.shape, dtype=bool)
-            unique_segments = np.unique(segments)
-            
-            for seg_id in unique_segments:
-                seg_mask = (segments == seg_id)
-                seg_scl_values = scl_segmented[seg_mask]
-                # Check if majority of pixels in segment have bad SCL
-                if len(seg_scl_values) > 0:
-                    unique_vals, counts = np.unique(seg_scl_values, return_counts=True)
-                    most_common = unique_vals[np.argmax(counts)]
-                    if most_common in bad_scl_set:
-                        bad_mask[seg_mask] = True
-            
-            return bad_mask
-        
-        bad_new = create_segment_bad_mask(st.session_state.segments, scl_segmented_new, BAD_SCL)
-        bad_old = create_segment_bad_mask(st.session_state.segments_old, scl_segmented_old, BAD_SCL)
-        bad_final = bad_new | bad_old
-        
-        # Create segment prediction arrays
-        def create_segment_prediction_array(segments, all_feats_df):
-            """Create array mapping segment IDs to predictions."""
-            seg_to_pred = dict(zip(all_feats_df['indx'], all_feats_df['prediction']))
-            prediction_img = np.zeros_like(segments, dtype=int)
-            for seg_id, pred in seg_to_pred.items():
-                prediction_img[segments == seg_id] = pred
-            return prediction_img
-        
-        prediction_new_img = create_segment_prediction_array(st.session_state.segments, st.session_state.all_feats_df)
-        prediction_old_img = create_segment_prediction_array(st.session_state.segments_old, st.session_state.all_feats_df_old)
-        
-        # Apply mask to exclude bad areas
-        valid_mask = ~bad_final
-        prediction_new_filtered = prediction_new_img[valid_mask]
-        prediction_old_filtered = prediction_old_img[valid_mask]
-
-        def class_percentages(prediction, class_names):
-            values, counts = np.unique(prediction, return_counts=True)
-            total = counts.sum()
-            out = {}
-            for v, c in zip(values, counts):
-                out[int(v)] = {
-                    "label": class_names.get(int(v), "Unknown"),
-                    "count": int(c),
-                    "percentage": 100 * c / total
-                }
-            return out, total
-
-        # Calculate statistics using filtered data
-        old_stats, old_total = class_percentages(prediction_old_filtered, st.session_state.class_names)
-        new_stats, new_total = class_percentages(prediction_new_filtered, st.session_state.class_names)
-
-        # Detect changes between old and new classifications
-        changed_mask = valid_mask & (prediction_old_img != prediction_new_img)
-        old_vals = prediction_old_img[changed_mask]
-        new_vals = prediction_new_img[changed_mask]
-        pairs, counts = np.unique(
-            np.stack([old_vals, new_vals], axis=1),
-            axis=0,
-            return_counts=True
-        )
-
-        # Store results in session state
-        st.session_state.old_stats = old_stats
-        st.session_state.new_stats = new_stats
-        st.session_state.changed_pairs = list(zip(pairs, counts))
-        st.session_state.total_changed = counts.sum()
-        st.session_state.valid_area_total = valid_mask.sum()
-        st.session_state.comparison_complete = True
-        
-        # Force rerun to display results
-        st.rerun()
-
-    # Display results (only runs after comparison_complete is True)
-    st.subheader(f"Change Detection: {st.session_state.old_date} vs {st.session_state.recent_date}")
-    
-    st.markdown(f"### Image from {st.session_state.old_date} - Statistics (Filtered)")
-    for k in sorted(st.session_state.old_stats):
-        v = st.session_state.old_stats[k]
-        st.write(f"Class {k:2d} ({v['label']:<22}): {v['count']:8d} px ({v['percentage']:6.2f}%)")
-    
-    st.markdown(f"### Image from {st.session_state.recent_date} - Statistics (Filtered)")
-    for k in sorted(st.session_state.new_stats):
-        v = st.session_state.new_stats[k]
-        st.write(f"Class {k:2d} ({v['label']:<22}): {v['count']:8d} px ({v['percentage']:6.2f}%)")
-    
-    st.markdown("### Class Changes (Filtered Area Only)")
-    st.write(f"Total changed pixels: {st.session_state.total_changed} ({100 * st.session_state.total_changed / st.session_state.valid_area_total:.2f}% of valid area)")
-    for (old_c, new_c), c in sorted(st.session_state.changed_pairs, key=lambda x: -x[1]):
-        st.write(
-            f"{int(old_c):2d} {st.session_state.class_names[int(old_c)]:<22} → "
-            f"{int(new_c):2d} {st.session_state.class_names[int(new_c)]:<22}: {int(c)} px ({100 * c / st.session_state.valid_area_total:.2f}%)"
-        )
-
-    st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if st.button("Back to Classification"):
-            st.session_state.step = 6
-            st.rerun()
-    with col2:
-        if st.button("Change Parameters"):
-            st.session_state.step = 3
-            st.session_state.seg_vis = None
-            st.session_state.seg_params = None
-            st.session_state.segments = None
-            st.session_state.classification_method = None
-            st.session_state.classification_results = None
-            st.session_state.comparison_complete = False
-            st.rerun()
-    with col3:
-        if st.button("Change Location"):
-            reset_to_step_one()
-
-
